@@ -29,11 +29,14 @@ void setup()
 void loop()
 {
   float Kp = 0.133;
-  float Sensor_Angle = DFOC_M0_Angle();    // 位置误差和换相角用同一个角度
+  float Sensor_Angle = DFOC_M0_Angle(); // 位置误差和换相角用同一个角度
   float target = serial_motor_target();
 
   // 位置闭环：误差(换算成度) × Kp → Uq，setTorque 内部会把 Uq 限幅到 ±Vbus/2
   setTorque(Kp * (target - Sensor_DIR * Sensor_Angle) * 180 / PI, _electricalAngle());
+
+  // 设置力矩
+  // setTorque(serial_motor_target(), _electricalAngle());
 
   // 到位后只打印一次：记住上一轮是否已在位，静止时不再刷屏
   static bool last_in_position = false;
