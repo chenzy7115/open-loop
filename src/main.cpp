@@ -1,117 +1,49 @@
+// 有感 FOC 位置闭环示例：所有 FOC 底层细节都在 lib/DengFOC 里，这里只写应用逻辑
+// 接口命名与灯哥 DengFOC 库 v0.1 一致：DFOC_Vbus / DFOC_alignSensor / setTorque /
+// _electricalAngle / DFOC_M0_Angle / serialReceiveUserCommand / serial_motor_target
+
 #include <Arduino.h>
+#include "DengFOC.h"
 
-// ---------------- PWM 引脚（U / V / W）----------------
-int pwmA = 32;
-int pwmB = 33;
-int pwmC = 25;
-
-// 限幅宏：把 amt 约束在 [low, high]（Arduino 自带 constrain，这里加下划线区分）
-#define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
-
-float voltage_power_supply = 12.6; // 母线电压 V
-float shaft_angle = 0;             // 机械角（累加）
-float open_loop_timestamp = 0;     // 上一轮时间戳
-float zero_electric_angle = 0;     // 零位偏移（开环恒 0）
-float Ualpha = 0, Ubeta = 0;
-float Ua = 0, Ub = 0, Uc = 0;
-float dc_a = 0, dc_b = 0, dc_c = 0;
+int Sensor_DIR = 1; // 编码器方向系数：本项目实测 +1；灯哥教程板为 -1，不能照抄
+int Motor_PP = 7;   // 电机极对数：2804 万向节电机是 7，2208 常见是 11
 
 void setup()
 {
   Serial.begin(115200);
 
-  pinMode(pwmA, OUTPUT);
-  pinMode(pwmB, OUTPUT);
-  pinMode(pwmC, OUTPUT);
-  pinMode(12, OUTPUT); // 使能驱动IC
-  digitalWrite(12, HIGH); // 拉高使能：pinMode 后默认低电平，不拉高功率级一直关断
+  pinMode(12, OUTPUT);    // 驱动板使能脚
+  digitalWrite(12, HIGH); // pinMode 后默认低电平，不拉高功率级一直关断
 
-  // core 3.x：ledcAttach 一步完成频率/精度设置与引脚绑定，取代旧版 ledcSetup + ledcAttachPin
-  ledcAttach(pwmA, 30000, 8); // pwm引脚, 30kHz, 8bit
-  ledcAttach(pwmB, 30000, 8);
-  ledcAttach(pwmC, 30000, 8);
+  DFOC_Vbus(12.6);                        // 母线电压 + 三相 PWM + AS5600 初始化
+  DFOC_alignSensor(Motor_PP, Sensor_DIR); // 零位标定，约 3 秒
 
-  Serial.println("PWM 初始化完成，3 秒后转动");
-  delay(3000);
-}
-
-// 电角度求解
-float _electricalAngle(float shaft_angle, int pole_pairs)
-{
-  return (shaft_angle * pole_pairs);
-}
-
-// 归一化角度到 [0,2PI]
-float _normalizeAngle(float angle)
-{
-  float a = fmod(angle, 2 * PI); // 取余运算可以用于归一化，列出特殊值例子算便知
-  return a >= 0 ? a : (a + 2 * PI);
-  // 三目运算符。格式：condition ? expr1 : expr2
-  // 其中，condition 是要求值的条件表达式，如果条件成立，则返回 expr1 的值，否则返回 expr2 的值。可以将三目运算符视为 if-else 语句的简化形式。
-  // fmod 函数的余数的符号与除数相同。因此，当 angle 的值为负数时，余数的符号将与 _2PI 的符号相反。也就是说，如果 angle 的值小于 0 且 _2PI 的值为正数，则 fmod(angle, _2PI) 的余数将为负数。
-  // 例如，当 angle 的值为 -PI/2，_2PI 的值为 2PI 时，fmod(angle, _2PI) 将返回一个负数。在这种情况下，可以通过将负数的余数加上 _2PI 来将角度归一化到 [0, 2PI] 的范围内，以确保角度的值始终为正数。
-}
-
-// 设置PWM到控制器输出
-void setPwm(float Ua, float Ub, float Uc)
-{
-
-  // 计算占空比
-  // 限制占空比从0到1
-  dc_a = _constrain(Ua / voltage_power_supply, 0.0f, 1.0f);
-  dc_b = _constrain(Ub / voltage_power_supply, 0.0f, 1.0f);
-  dc_c = _constrain(Uc / voltage_power_supply, 0.0f, 1.0f);
-
-  // 写入PWM：core 3.x 按【引脚】写（旧版才是按通道 0/1/2 写，写错不报错但无任何输出）
-  ledcWrite(pwmA, dc_a * 255);
-  ledcWrite(pwmB, dc_b * 255);
-  ledcWrite(pwmC, dc_c * 255);
-}
-
-void setPhaseVoltage(float Uq, float Ud, float angle_el)
-{
-  angle_el = _normalizeAngle(angle_el + zero_electric_angle);
-  // 帕克逆变换
-  Ualpha = -Uq * sin(angle_el);
-  Ubeta = Uq * cos(angle_el);
-
-  // 克拉克逆变换
-  Ua = Ualpha + voltage_power_supply / 2;
-  Ub = (sqrt(3) * Ubeta - Ualpha) / 2 + voltage_power_supply / 2;
-  Uc = (-Ualpha - sqrt(3) * Ubeta) / 2 + voltage_power_supply / 2;
-  setPwm(Ua, Ub, Uc);
-}
-
-// 开环速度函数
-float velocityOpenloop(float target_velocity)
-{
-  unsigned long now_us = micros(); // 获取从开启芯片以来的微秒数，它的精度是 4 微秒。 micros() 返回的是一个无符号长整型（unsigned long）的值
-
-  // 计算当前每个Loop的运行时间间隔
-  float Ts = (now_us - open_loop_timestamp) * 1e-6f;
-
-  // 由于 micros() 函数返回的时间戳会在大约 70 分钟之后重新开始计数，在由70分钟跳变到0时，TS会出现异常，因此需要进行修正。如果时间间隔小于等于零或大于 0.5 秒，则将其设置为一个较小的默认值，即 1e-3f
-  if (Ts <= 0 || Ts > 0.5f)
-    Ts = 1e-3f;
-
-  // 通过乘以时间间隔和目标速度来计算需要转动的机械角度，存储在 shaft_angle 变量中。在此之前，还需要对轴角度进行归一化，以确保其值在 0 到 2π 之间。
-  shaft_angle = _normalizeAngle(shaft_angle + target_velocity * Ts);
-  // 以目标速度为 10 rad/s 为例，如果时间间隔是 1 秒，则在每个循环中需要增加 10 * 1 = 10 弧度的角度变化量，才能使电机转动到目标速度。
-  // 如果时间间隔是 0.1 秒，那么在每个循环中需要增加的角度变化量就是 10 * 0.1 = 1 弧度，才能实现相同的目标速度。因此，电机轴的转动角度取决于目标速度和时间间隔的乘积。
-
-  // 使用早前设置的voltage_power_supply的1/3作为Uq值，这个值会直接影响输出力矩
-  // 最大只能设置为Uq = voltage_power_supply/2，否则ua,ub,uc会超出供电电压限幅
-  float Uq = voltage_power_supply / 3;
-
-  setPhaseVoltage(Uq, 0, _electricalAngle(shaft_angle, 7));
-
-  open_loop_timestamp = now_us; // 用于计算下一个时间间隔
-
-  return Uq;
+  // 闭环平衡点是 θ = DIR × target，所以乘 DIR 才能锁在上电时的位置，
+  // 而不是被拉到 0 rad（否则上电瞬间电机会突然转一大段）
+  DFOC_setTarget(Sensor_DIR * DFOC_M0_Angle());
+  Serial.print("已锁定当前位置：");
+  Serial.println(serial_motor_target());
+  Serial.println("串口发送目标角度（单位 rad，回车结束）即可让它转到该位置");
 }
 
 void loop()
 {
-  // put your main code here, to run repeatedly:
-  velocityOpenloop(5);
+  float Kp = 0.133;
+  float Sensor_Angle = DFOC_M0_Angle();    // 位置误差和换相角用同一个角度
+  float target = serial_motor_target();
+
+  // 位置闭环：误差(换算成度) × Kp → Uq，setTorque 内部会把 Uq 限幅到 ±Vbus/2
+  setTorque(Kp * (target - Sensor_DIR * Sensor_Angle) * 180 / PI, _electricalAngle());
+
+  // 到位后只打印一次：记住上一轮是否已在位，静止时不再刷屏
+  static bool last_in_position = false;
+  bool in_position = fabs(target - Sensor_DIR * Sensor_Angle) < 0.05f; // 误差 < 0.05 rad（约 2.9°）算到位
+  if (in_position && !last_in_position)
+  {
+    Serial.print("已到位，当前角: ");
+    Serial.println(Sensor_Angle);
+  }
+  last_in_position = in_position;
+
+  serialReceiveUserCommand(); // 解析串口新目标
 }
